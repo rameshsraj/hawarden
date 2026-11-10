@@ -1,0 +1,59 @@
+# hawarden configuration — install to /etc/hawarden.yaml (mode 0600).
+cluster: prod-ha
+state_dir: /var/lib/hawarden
+operators: {}
+allowed_operators: []
+
+patroni:
+  api_port: 8008
+  scheme: http
+  user: ""
+  password_ref: ""        # credential file path, never the password itself
+  timeout: 3s
+
+etcd:
+  endpoints: ["10.0.0.11:2379", "10.0.0.12:2379", "10.0.0.13:2379"]
+  dial_timeout: 3s
+  cacert_ref: ""
+  cert_ref: ""
+  key_ref: ""
+  metrics: true
+
+vips:
+  - address: 10.0.0.50
+    interface: ens192
+    policy: leader_only   # leader_only|proxy_tier|user_defined
+
+ssh:
+  key: /root/.ssh/id_ed25519
+  known_hosts: /root/.ssh/known_hosts
+  timeout: 5s
+  strict_host_key: false
+
+interval: 2s
+timeout: 3s
+lag: { warn_seconds: 1800, crit_seconds: 3600 }
+wal_volume_bytes: 100GB
+
+# Least-privilege PostgreSQL replication context. Disabled by default;
+# enable only with pg.adapter: ssh-psql on the host.
+replication_context: false
+
+audit:
+  file: /var/lib/hawarden/audit.jsonl
+  syslog: true
+  read_commands: false
+  retention_days: 31
+history:
+  retention_days: 14
+  snapshot_every: 30s
+
+hosts:
+  - name: db1
+    address: 10.0.0.11
+    roles: [patroni, pg, keepalived, etcd]
+    ssh_user: root
+    patroni: { conf: /etc/patroni/patroni.yml, log_dir: /var/log/patroni, service: patroni, api: http://10.0.0.11:8008 }
+    pg:      { port: 5432, data_dir: /var/lib/pgsql/16/data, adapter: ssh-psql, user: postgres }
+    keepalived: { conf: /etc/keepalived/keepalived.conf, service: keepalived, journal_unit: keepalived, state_file: /run/keepalived.hawarden.state }
+    etcd:      { name: etcd-1, service: etcd, data_dir: /var/lib/etcd }

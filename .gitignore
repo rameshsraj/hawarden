@@ -1,0 +1,11 @@
+# Build outputs
+bin/
+dist/
+*.exe
+
+# Local specs and test artefacts — not part of the public repo
+DASHBOARD_PROMPTS.md
+TODO_PROMPTS.md
+docs/
+testbed/
+*.local.yaml
