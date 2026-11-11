@@ -356,8 +356,9 @@ function buildTopoGraph(s) {
       ["API", okChip(x.api_reachable)],
       ["TL/LAG", `<span class="muted">tl ${dash(x.timeline)} · ${x.lag_bytes < 0 ? "lag —" : "lag " + bytes(x.lag_bytes)}</span>`],
     ];
-    if (be) rows.push(["PG", chip(be.in_recovery ? "replica" : "primary", be.in_recovery ? "info" : "ok"),
-      ].join(" ") + (be.replay_lsn >= 0 ? `<span class="muted"> lsn ${be.replay_lsn.toString(16).toUpperCase()}</span>` : ""));
+    if (be) rows.push(["PG",
+      chip(be.in_recovery ? "replica" : "primary", be.in_recovery ? "info" : "ok") +
+      (be.replay_lsn >= 0 ? ` <span class="muted">lsn ${be.replay_lsn.toString(16).toUpperCase()}</span>` : "")]);
     const xpos = pgX.get(x.name) !== undefined ? pgX.get(x.name) : X0;
     nodes.push({
       id: "pg-" + x.name, x: xpos, y: PGROW_Y, w: NW, h: 118,

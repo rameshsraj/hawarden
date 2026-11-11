@@ -5,6 +5,7 @@ package collector
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -303,6 +304,25 @@ func (c *Collector) Collect(ctx context.Context) *model.Snapshot {
 		}
 		snap.VIP = append(snap.VIP, chk)
 	}
+
+	// deterministic ordering — parallel collection appends in completion
+	// order, which would make dashboard layout jump between cycles
+	sort.Slice(snap.Keepalived, func(i, j int) bool { return snap.Keepalived[i].Host < snap.Keepalived[j].Host })
+	sort.Slice(snap.Etcd.Members, func(i, j int) bool { return snap.Etcd.Members[i].Endpoint < snap.Etcd.Members[j].Endpoint })
+	sort.Slice(snap.Backends, func(i, j int) bool { return snap.Backends[i].Host < snap.Backends[j].Host })
+	sort.Slice(snap.Flows, func(i, j int) bool {
+		if snap.Flows[i].Host != snap.Flows[j].Host {
+			return snap.Flows[i].Host < snap.Flows[j].Host
+		}
+		return snap.Flows[i].Iface < snap.Flows[j].Iface
+	})
+	sort.Slice(snap.Sources, func(i, j int) bool {
+		if snap.Sources[i].Source != snap.Sources[j].Source {
+			return snap.Sources[i].Source < snap.Sources[j].Source
+		}
+		return snap.Sources[i].Target < snap.Sources[j].Target
+	})
+	sort.Slice(snap.Patroni.Members, func(i, j int) bool { return snap.Patroni.Members[i].Name < snap.Patroni.Members[j].Name })
 
 	snap.DurationMs = time.Since(t0).Milliseconds()
 	snap.Degraded = len(snap.Errors) > 0 || !snap.Patroni.Available || (snap.Etcd.QuorumKnown && snap.Etcd.QuorumLost)
