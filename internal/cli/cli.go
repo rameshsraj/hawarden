@@ -135,6 +135,45 @@ func Execute() int {
 		},
 	})
 
+	// service: status/start/stop/restart of HA units on monitored hosts
+	var confirm string
+	svcCmd := &cobra.Command{
+		Use:   "service <verb> <unit> <host>",
+		Short: "status/start/stop/restart patroni|postgresql|keepalived|etcd on a host",
+		Args:  cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			verb, unit, hostName := args[0], args[1], args[2]
+			s, err := svc(cmd)
+			if err != nil {
+				return err
+			}
+			role, ok := service.UnitRole(unit)
+			if !ok {
+				return exitcode.New(exitcode.Usage, "unknown unit").WithCause(unit).
+					WithHint("units: patroni postgresql keepalived etcd")
+			}
+			h, ok := s.Cfg.HostByName(hostName)
+			if !ok {
+				return exitcode.New(exitcode.Usage, "unknown host").WithCause(hostName).
+					WithHint("hawarden config show")
+			}
+			if !h.Has(role) {
+				return exitcode.New(exitcode.Usage, "host does not run this unit").
+					WithCause(fmt.Sprintf("%s has no %s role", hostName, role)).
+					WithHint("roles are configured in the Configuration console")
+			}
+			res, err := s.ServiceControl(ctx, h, unit, verb, confirm)
+			if jsonOut {
+				_ = writeJSON(os.Stdout, res)
+			} else {
+				renderService(os.Stdout, res)
+			}
+			return err
+		},
+	}
+	svcCmd.Flags().StringVar(&confirm, "confirm", "", "typed confirmation (must equal the host name) — required for start/stop/restart")
+	root.AddCommand(svcCmd)
+
 	root.AddCommand(configCmds())
 
 	if err := root.Execute(); err != nil {

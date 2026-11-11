@@ -137,6 +137,7 @@ type PGCfg struct {
 	User    string `yaml:"user,omitempty" json:"user,omitempty"`
 	Port    int    `yaml:"port,omitempty" json:"port,omitempty"`
 	DataDir string `yaml:"data_dir,omitempty" json:"data_dir,omitempty"`
+	Service string `yaml:"service,omitempty" json:"service,omitempty"` // systemctl unit name
 }
 
 // HostPatroni is per-host Patroni context.

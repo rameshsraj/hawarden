@@ -7,7 +7,32 @@ import (
 	"text/tabwriter"
 
 	"github.com/rameshsraj/hawarden/internal/model"
+	"github.com/rameshsraj/hawarden/internal/service"
 )
+
+func renderService(w io.Writer, r service.ServiceResult) {
+	state := "down"
+	if r.Running {
+		state = "running"
+	}
+	head := "ok"
+	if r.Err != "" {
+		head = "FAILED"
+	}
+	fmt.Fprintf(w, "%s: %s %s on %s via %s — %s", head, r.Verb, r.Unit, r.Host, r.Manager, state)
+	if r.PIDs != "" && r.Running {
+		fmt.Fprintf(w, " (pid %s)", r.PIDs)
+	}
+	fmt.Fprintln(w)
+	for _, e := range r.Evidence {
+		if e != "" {
+			fmt.Fprintf(w, "  · %s\n", e)
+		}
+	}
+	if r.Err != "" {
+		fmt.Fprintf(w, "  · err: %s\n", r.Err)
+	}
+}
 
 func tw(w io.Writer) *tabwriter.Writer {
 	return tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)

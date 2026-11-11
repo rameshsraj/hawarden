@@ -141,6 +141,11 @@ tr:last-child td { border-bottom:0 }
   padding:.5rem 1rem; font-weight:600; cursor:pointer }
 .btn.sec { background:none; border:1px solid var(--line); color:var(--text) }
 .btn.danger { background:none; border:1px solid var(--crit); color:var(--crit) }
+.btn.mini { padding:.1rem .35rem; font-size:11px; margin-right:2px; opacity:.85 }
+.btn.mini:hover { opacity:1 }
+.btn.mini:disabled { opacity:.35; cursor:default }
+.svc-cell { display:inline-block; min-width:3.2rem }
+.svc-btns { white-space:nowrap }
 .checks label { display:flex; gap:.5rem; align-items:center; padding:.2rem 0; color:var(--text) }
 .checks input { accent-color:var(--accent) }
 .probe { margin-top:.7rem; background:var(--panel2); border:1px solid var(--line);

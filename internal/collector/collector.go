@@ -39,6 +39,10 @@ func New(cfg *config.Config) *Collector {
 // Close releases pooled SSH connections.
 func (c *Collector) Close() { c.runner.Close() }
 
+// Runner exposes the SSH runner for service-layer probes (keepalived,
+// service control) that need direct remote access.
+func (c *Collector) Runner() remote.Runner { return c.runner }
+
 func (c *Collector) sshHost(h config.Host) remote.Host {
 	return remote.Host{Name: h.Name, Address: h.Address, User: h.SSHUser}
 }

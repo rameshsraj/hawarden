@@ -683,6 +683,14 @@ async function renderOperations(m) {
   log.scrollTop = log.scrollHeight;
   grid.append(card("source event log (latest snapshot)", "c8", log));
 
+  // ---- service control: status/start/stop/restart via `hawarden service` ----
+  let cfg = null;
+  try { cfg = await api("/api/config"); } catch (_) {}
+  const svcCard = el("div");
+  svcCard.append(card("service control", "c12", svcMatrix(cfg)));
+  grid.append(svcCard.children[0]);
+  wireServiceCtl(svcCard);
+
   let ops = { ops: [] };
   try { ops = await api("/api/ops"); } catch (_) {}
   const all = [...S.opLog, ...(ops.ops || [])];
@@ -695,6 +703,89 @@ async function renderOperations(m) {
     rows.length ? tbl(["time","operator","action","target","result","detail"], rows)
                 : "<p class='muted'>no operations recorded</p>"));
   m.append(grid);
+}
+
+// unit → role + observed state from the live snapshot
+const SVC_UNITS = ["patroni", "postgresql", "keepalived", "etcd"];
+const unitRole = { patroni: "patroni", postgresql: "pg", keepalived: "keepalived", etcd: "etcd" };
+
+function svcState(host, unit, s) {
+  if (!s) return ["unknown", "mut"];
+  const byName = (arr, f) => (arr || []).find(f);
+  switch (unit) {
+    case "patroni": {
+      const m = byName(s.patroni && s.patroni.members, x => x.name === host.name || x.host === host.name || x.host === host.address);
+      if (!m) return ["n/a", "mut"];
+      if (!m.api_reachable) return ["api down", "crit"];
+      return [m.state || "?", m.state === "running" || m.state === "streaming" ? "ok" : "warn"];
+    }
+    case "postgresql": {
+      const b = byName(s.backends, x => x.host === host.name || x.host === host.address);
+      if (!b) return ["n/a", "mut"];
+      if (!b.reachable) return ["down", "crit"];
+      return [b.in_recovery ? "replica" : "primary", "ok"];
+    }
+    case "keepalived": {
+      const k = byName(s.keepalived, x => x.host === host.name || x.host === host.address);
+      if (!k) return ["n/a", "mut"];
+      if (!k.reachable) return ["unreachable", "crit"];
+      if (!k.process_up) return ["proc down", "crit"];
+      return [k.vrrp_state || "?", k.vrrp_state === "MASTER" || k.vrrp_state === "BACKUP" ? "ok" : "warn"];
+    }
+    case "etcd": {
+      const e = byName(s.etcd && s.etcd.members, x => (x.endpoint || "").split(":")[0] === host.name);
+      if (!e) return ["n/a", "mut"];
+      if (!e.reachable) return ["down", "crit"];
+      return [e.healthy ? (e.is_leader ? "healthy·leader" : "healthy") : "unhealthy", e.healthy ? "ok" : "warn"];
+    }
+  }
+  return ["?", "mut"];
+}
+
+function svcMatrix(cfg) {
+  const s = S.snap;
+  const hosts = (cfg && cfg.hosts || []).filter(h => (h.roles || []).length);
+  if (!hosts.length) return "<p class='muted'>no machines configured — add one in the Configuration console</p>";
+  const rows = hosts.map(h => {
+    const cells = SVC_UNITS.map(u => {
+      if (!(h.roles || []).includes(unitRole[u])) return `<td class="muted">—</td>`;
+      const [st, sev] = svcState(h, u, s);
+      const dis = h.ssh_disabled ? "disabled" : "";
+      return `<td><span class="svc-cell">${chip(st, sev)}</span>
+        <span class="svc-btns">
+          <button class="btn mini" data-svc="status" data-unit="${u}" data-host="${esc(h.name)}" ${dis}>st</button>
+          <button class="btn mini" data-svc="start" data-unit="${u}" data-host="${esc(h.name)}" ${dis}>▶</button>
+          <button class="btn mini" data-svc="stop" data-unit="${u}" data-host="${esc(h.name)}" ${dis}>■</button>
+          <button class="btn mini" data-svc="restart" data-unit="${u}" data-host="${esc(h.name)}" ${dis}>⟳</button>
+        </span></td>`;
+    }).join("");
+    return `<tr><td><b class="mono">${esc(h.name)}</b><div class="muted" style="font-size:10px">${esc((h.roles || []).join(" "))}</div></td>${cells}</tr>`;
+  }).join("");
+  return `<table class="tbl"><thead><tr><th>HOST</th>${SVC_UNITS.map(u => "<th>" + u.toUpperCase() + "</th>").join("")}</tr></thead><tbody>${rows}</tbody></table>
+    <p class="muted" style="margin-top:.4rem">state = observed from the live snapshot · ▶ start · ■ stop · ⟳ restart · st status — mutations need typed host confirmation and are journaled</p>`;
+}
+
+function wireServiceCtl(root) {
+  root.querySelectorAll("[data-svc]").forEach(b => b.addEventListener("click", async () => {
+    const verb = b.dataset.svc, unit = b.dataset.unit, host = b.dataset.host;
+    let confirm = "";
+    if (verb !== "status") {
+      confirm = window.prompt(`${verb} ${unit} on ${host}\ntype the host name to confirm`);
+      if (confirm === null) return;
+    }
+    b.disabled = true;
+    try {
+      const res = await api("/api/service", {
+        method: "POST",
+        body: JSON.stringify({ verb, unit, host, confirm }),
+      });
+      const det = (res.evidence || []).join(" · ");
+      alert(`${res.ok ? "ok" : "FAILED"}: ${verb} ${unit} on ${host}\n` +
+        `manager: ${res.manager} · running: ${res.running}` +
+        (res.pids ? ` · pid ${res.pids}` : "") + (det ? `\n${det}` : "") + (res.err ? `\nerr: ${res.err}` : ""));
+    } catch (e) { alert(e.message); }
+    render();
+  }));
 }
 
 /* ---------- configuration console ---------- */

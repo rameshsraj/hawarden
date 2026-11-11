@@ -12,9 +12,11 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -121,6 +123,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/config/remove-host", s.requireAuth(s.removeHost))
 	mux.HandleFunc("POST /api/config/set", s.requireAuth(s.setField))
 	mux.HandleFunc("GET /api/ops", s.requireAuth(s.listOps))
+	mux.HandleFunc("POST /api/service", s.requireAuth(s.serviceCtl))
 	mux.HandleFunc("GET /api/monitor", s.requireAuth(func(w http.ResponseWriter, _ *http.Request, _ *session) {
 		writeJSON(w, 200, map[string]any{"running": s.mon.isRunning(), "seq": s.mon.lastSeq()})
 	}))
@@ -337,6 +340,47 @@ func (s *Server) setField(w http.ResponseWriter, r *http.Request, sess *session)
 		return
 	}
 	s.mon.restart()
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(out)
+}
+
+// serviceCtl runs `hawarden service <verb> <unit> <host>` — status is a
+// read, start/stop/restart are mutations that require the typed host-name
+// confirmation (enforced server-side and again inside the CLI).
+var serviceVerbs = map[string]bool{"status": true, "start": true, "stop": true, "restart": true}
+var serviceUnits = map[string]bool{"patroni": true, "postgresql": true, "pg": true, "keepalived": true, "etcd": true}
+var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
+
+func (s *Server) serviceCtl(w http.ResponseWriter, r *http.Request, sess *session) {
+	var req struct {
+		Verb    string `json:"verb"`
+		Unit    string `json:"unit"`
+		Host    string `json:"host"`
+		Confirm string `json:"confirm"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeJSON(w, 400, errBody("bad request"))
+		return
+	}
+	if !serviceVerbs[req.Verb] || !serviceUnits[req.Unit] || !safeName.MatchString(req.Host) {
+		writeJSON(w, 400, errBody("invalid verb/unit/host"))
+		return
+	}
+	argv := []string{"service", req.Verb, req.Unit, req.Host, "--json"}
+	if req.Verb != "status" {
+		if req.Confirm != req.Host {
+			writeJSON(w, 400, errBody("typed confirmation required: confirm must equal the host name"))
+			return
+		}
+		argv = append(argv, "--confirm", req.Host)
+	}
+	out, stderr, err := s.runCLI(r.Context(), argv...)
+	ok := err == nil
+	s.ops.record(sess.Operator, fmt.Sprintf("service %s %s", req.Verb, req.Unit), req.Host, ok, trimStr(string(out), 400))
+	if !ok && len(out) == 0 {
+		writeJSON(w, 502, cliErr(stderr, err))
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(out)
 }
