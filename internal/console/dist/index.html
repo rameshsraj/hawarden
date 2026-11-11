@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hawarden console</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <div id="login" class="login hidden">
+    <form id="login-form" class="login-card">
+      <h1>hawarden</h1>
+      <p class="muted">HA cluster console — Patroni · keepalived · etcd</p>
+      <input id="login-operator" placeholder="operator name (optional)" autocomplete="username">
+      <input id="login-token" type="password" placeholder="access token" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+      <div id="login-err" class="error"></div>
+    </form>
+  </div>
+
+  <div id="shell" class="hidden">
+    <nav id="nav">
+      <div class="brand">hawarden</div>
+      <a data-screen="overview" class="nav-item">Overview</a>
+      <a data-screen="topology" class="nav-item">Topology</a>
+      <a data-screen="patroni" class="nav-item">Patroni</a>
+      <a data-screen="etcd" class="nav-item">etcd</a>
+      <a data-screen="vip" class="nav-item">VIP</a>
+      <a data-screen="events" class="nav-item">Events</a>
+      <a data-screen="operations" class="nav-item">Operations</a>
+      <a data-screen="configuration" class="nav-item">Configuration</a>
+      <div class="nav-spacer"></div>
+      <button id="theme-btn" class="ghost" title="toggle theme">◐</button>
+      <button id="logout-btn" class="ghost">logout</button>
+    </nav>
+    <header id="hdr">
+      <span id="hdr-cluster">—</span>
+      <span id="hdr-live" class="pill">connecting…</span>
+      <span id="hdr-age" class="muted"></span>
+      <span id="hdr-cycle" class="muted"></span>
+      <span id="hdr-degraded" class="pill warn hidden">degraded</span>
+    </header>
+    <main id="main"></main>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,6 +1,6 @@
-# Build outputs
-bin/
-dist/
+# Build outputs (top-level only — internal/console/dist is embedded source)
+/bin/
+/dist/
 *.exe
 
 # Local specs and test artefacts — not part of the public repo
