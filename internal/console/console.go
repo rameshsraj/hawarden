@@ -415,5 +415,8 @@ func (s *Server) spa(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// embedded assets always revalidate — a console upgrade must not leave
+	// browsers running a stale frontend
+	w.Header().Set("Cache-Control", "no-cache")
 	http.ServeContent(w, r, name, st.ModTime(), bytes.NewReader(data))
 }
