@@ -23,6 +23,7 @@ type Snapshot struct {
 	Backends       []Backend        `json:"backends,omitempty"`
 	Flows          []FlowSample     `json:"flows,omitempty"`
 	VIP            []VIPCheck       `json:"vip"`
+	Proxy          *ProxyState      `json:"proxy,omitempty"`
 	Findings       []Finding        `json:"findings,omitempty"`
 	Sources        []SourceHealth   `json:"sources"`
 	Errors         []SourceError    `json:"errors,omitempty"`
@@ -73,30 +74,56 @@ type HistoryEntry struct {
 
 // EtcdState is the DCS coordination view.
 type EtcdState struct {
-	Available      bool         `json:"available"`
-	Err            string       `json:"err,omitempty"`
-	LeaderID       string       `json:"leader_id,omitempty"`
-	LeaderEndpoint string       `json:"leader_endpoint,omitempty"`
-	Members        []EtcdMember `json:"members"`
-	Alarms         []string     `json:"alarms,omitempty"`
-	QuorumLost     bool         `json:"quorum_lost"`
-	QuorumKnown    bool         `json:"quorum_known"` // false = insufficient evidence
-	Version        string       `json:"version,omitempty"`
+	Available      bool              `json:"available"`
+	Err            string            `json:"err,omitempty"`
+	LeaderID       string            `json:"leader_id,omitempty"`
+	LeaderEndpoint string            `json:"leader_endpoint,omitempty"`
+	Members        []EtcdMember      `json:"members"`
+	Alarms         []string          `json:"alarms,omitempty"`
+	QuorumLost     bool              `json:"quorum_lost"`
+	QuorumKnown    bool              `json:"quorum_known"` // false = insufficient evidence
+	Version        string            `json:"version,omitempty"`
+	Roster         []EtcdRosterEntry `json:"roster,omitempty"` // cluster's own member list
+	Links          []EtcdLink        `json:"links,omitempty"`  // observed raft peer streams
+}
+
+// EtcdRosterEntry is one member from the cluster's MemberList RPC. Endpoint
+// is the configured endpoint matched by member ID; empty = not in config.
+type EtcdRosterEntry struct {
+	ID         string   `json:"id"` // hex
+	Name       string   `json:"name"`
+	PeerURLs   []string `json:"peer_urls"`
+	ClientURLs []string `json:"client_urls"`
+	Learner    bool     `json:"learner,omitempty"`
+	Endpoint   string   `json:"endpoint,omitempty"`
+}
+
+// EtcdLink is one directed raft stream observed from the sender's metrics
+// (etcd_network_active_peers / etcd_network_peer_sent_bytes_total).
+type EtcdLink struct {
+	From   string  `json:"from"` // member ID (hex)
+	To     string  `json:"to"`
+	Active bool    `json:"active"`
+	Bps    float64 `json:"bps"` // sent bytes/s over the last cycle; -1 unknown
 }
 
 // EtcdMember is one etcd endpoint observation.
 type EtcdMember struct {
-	Endpoint      string `json:"endpoint"`
-	Name          string `json:"name,omitempty"`
-	Healthy       bool   `json:"healthy"`
-	Reachable     bool   `json:"reachable"`
-	HasLeader     bool   `json:"has_leader"`
-	IsLeader      bool   `json:"is_leader"`      // true only when the member self-identifies as raft leader
-	LeaderChanges int64  `json:"leader_changes"` // -1 unknown
-	DBSizeBytes   int64  `json:"db_size_bytes"`  // -1 unknown
-	RaftIndex     int64  `json:"raft_index"`     // -1 unknown
-	RaftTerm      int64  `json:"raft_term"`      // -1 unknown
-	Err           string `json:"err,omitempty"`
+	Endpoint      string   `json:"endpoint"`
+	ID            string   `json:"id,omitempty"`        // member ID (hex) from Status
+	LeaderID      string   `json:"leader_id,omitempty"` // leader this member reports
+	Name          string   `json:"name,omitempty"`
+	Healthy       bool     `json:"healthy"`
+	Reachable     bool     `json:"reachable"`
+	HasLeader     bool     `json:"has_leader"`
+	IsLeader      bool     `json:"is_leader"`      // true only when the member self-identifies as raft leader
+	LeaderChanges int64    `json:"leader_changes"` // -1 unknown
+	DBSizeBytes   int64    `json:"db_size_bytes"`  // -1 unknown
+	RaftIndex     int64    `json:"raft_index"`     // -1 unknown
+	RaftTerm      int64    `json:"raft_term"`      // -1 unknown
+	PeersKnown    bool     `json:"peers_known,omitempty"`
+	ActivePeers   []string `json:"active_peers,omitempty"` // remote IDs with a live raft stream
+	Err           string   `json:"err,omitempty"`
 }
 
 // KeepalivedNode is the VRRP observation on one host.
@@ -117,11 +144,38 @@ type KeepalivedNode struct {
 type VIPCheck struct {
 	Address   string   `json:"address"`
 	Interface string   `json:"interface,omitempty"`
-	Policy    string   `json:"policy"`   // leader_only|proxy_tier|user_defined
-	Holders   []string `json:"holders"`  // hosts observed holding the address
-	Observed  bool     `json:"observed"` // at least one holder evidence
-	Absent    bool     `json:"absent"`   // verified absent everywhere reachable
-	Unknown   bool     `json:"unknown"`  // insufficient evidence either way
+	Policy    string   `json:"policy"`             // leader_only|proxy_tier|user_defined
+	Holders   []string `json:"holders"`            // hosts observed holding the address
+	Observed  bool     `json:"observed"`           // at least one holder evidence
+	Absent    bool     `json:"absent"`             // verified absent everywhere reachable
+	Unknown   bool     `json:"unknown"`            // insufficient evidence either way
+	Evidence  string   `json:"evidence,omitempty"` // how holders were observed (ssh|arp)
+}
+
+// ProxyState is the HAProxy tier. Routing is observed through the routing
+// contract itself: the Patroni health check each listener uses. HAProxy's
+// own backend table is not read (its stats socket is host-local).
+type ProxyState struct {
+	Listeners []ProxyListener `json:"listeners"`
+	Nodes     []ProxyNode     `json:"nodes"`
+}
+
+// ProxyListener is one frontend and the members its health check admits.
+type ProxyListener struct {
+	Name        string          `json:"name"`
+	Port        int             `json:"port"`
+	Check       string          `json:"check"`
+	Write       bool            `json:"write"`                 // check selects the primary only
+	Eligible    []string        `json:"eligible"`              // members whose check returned 200
+	Unreachable []string        `json:"unreachable,omitempty"` // members whose check could not be read
+	VIPOpen     map[string]bool `json:"vip_open,omitempty"`    // VIP address -> TCP accepts on Port
+}
+
+// ProxyNode is one HAProxy host's listener reachability.
+type ProxyNode struct {
+	Host    string          `json:"host"`
+	Address string          `json:"address"`
+	Open    map[string]bool `json:"open"` // listener name -> TCP accepts
 }
 
 // Backend is a light PostgreSQL observation (replication context adapter
@@ -159,6 +213,7 @@ type SourceHealth struct {
 	Source     string    `json:"source"` // patroni|etcd|keepalived|pg|host
 	Target     string    `json:"target"`
 	OK         bool      `json:"ok"`
+	Skipped    bool      `json:"skipped,omitempty"` // disabled by config; not a failure
 	LastOK     time.Time `json:"last_ok,omitempty"`
 	DurationMs int64     `json:"duration_ms"`
 	Err        string    `json:"err,omitempty"`

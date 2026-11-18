@@ -30,6 +30,7 @@ const (
 	RolePG         Role = "pg"
 	RoleKeepalived Role = "keepalived"
 	RoleEtcd       Role = "etcd"
+	RoleHAProxy    Role = "haproxy"
 )
 
 // ByteSize is a byte count that marshals as "100GB"-style values.
@@ -104,6 +105,14 @@ type VIP struct {
 	Address   string `yaml:"address" json:"address"`
 	Interface string `yaml:"interface" json:"interface"`
 	Policy    string `yaml:"policy" json:"policy"` // leader_only|proxy_tier|user_defined
+}
+
+// ProxyListener is one HAProxy frontend whose backend selection follows a
+// Patroni REST health check (HAProxy `option httpchk GET <check>`).
+type ProxyListener struct {
+	Name  string `yaml:"name" json:"name"`
+	Port  int    `yaml:"port" json:"port"`
+	Check string `yaml:"check" json:"check"` // e.g. /primary, /replica
 }
 
 type SSH struct {
@@ -192,6 +201,7 @@ type Config struct {
 	Patroni            PatroniCfg        `yaml:"patroni" json:"patroni"`
 	Etcd               EtcdCfg           `yaml:"etcd" json:"etcd"`
 	VIPs               []VIP             `yaml:"vips" json:"vips"`
+	Proxy              []ProxyListener   `yaml:"proxy,omitempty" json:"proxy,omitempty"`
 	SSH                SSH               `yaml:"ssh" json:"ssh"`
 	Interval           time.Duration     `yaml:"interval" json:"interval"`
 	Timeout            time.Duration     `yaml:"timeout" json:"timeout"`
@@ -320,9 +330,9 @@ func (c *Config) Validate() error {
 		}
 		for j, r := range h.Roles {
 			switch r {
-			case RolePatroni, RolePG, RoleKeepalived, RoleEtcd:
+			case RolePatroni, RolePG, RoleKeepalived, RoleEtcd, RoleHAProxy:
 			default:
-				badf("%s.roles[%d]: %q must be patroni|pg|keepalived|etcd", base, j, string(r))
+				badf("%s.roles[%d]: %q must be patroni|pg|keepalived|etcd|haproxy", base, j, string(r))
 			}
 		}
 		if h.PG != nil && h.PG.Adapter != "" && h.PG.Adapter != "ssh-psql" {
@@ -350,6 +360,17 @@ func (c *Config) Validate() error {
 			badf("vips[%d].policy: %q must be leader_only|proxy_tier|user_defined", i, v.Policy)
 		}
 	}
+	for i, l := range c.Proxy {
+		if l.Name == "" {
+			badf("proxy[%d].name: must not be empty", i)
+		}
+		if l.Port < 1 || l.Port > 65535 {
+			badf("proxy[%d].port: %d out of range", i, l.Port)
+		}
+		if !strings.HasPrefix(l.Check, "/") {
+			badf("proxy[%d].check: %q must be a Patroni REST path like /primary", i, l.Check)
+		}
+	}
 	for _, ep := range c.Etcd.Endpoints {
 		if _, _, err := net.SplitHostPort(ep); err != nil {
 			badf("etcd.endpoints: %q must be host:port", ep)
@@ -360,10 +381,16 @@ func (c *Config) Validate() error {
 		{"ssh.key", c.SSH.Key},
 		{"ssh.known_hosts", c.SSH.KnownHosts},
 		{"audit.file", c.Audit.File},
+		{"etcd.cacert_ref", c.Etcd.CACertRef},
+		{"etcd.cert_ref", c.Etcd.CertRef},
+		{"etcd.key_ref", c.Etcd.KeyRef},
 	} {
 		if f[1] != "" && !filepath.IsAbs(f[1]) {
 			bad(f[0] + ": must be absolute")
 		}
+	}
+	if (c.Etcd.CertRef == "") != (c.Etcd.KeyRef == "") {
+		bad("etcd: cert_ref and key_ref must be set together")
 	}
 	if len(p) > 0 {
 		return exitcode.New(exitcode.Usage, "invalid config").

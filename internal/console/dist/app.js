@@ -96,7 +96,9 @@ function connectStream() {
   es.addEventListener("snapshot", (e) => {
     const ev = JSON.parse(e.data);
     S.snap = ev.data; S.connected = true; S.lastEvent = Date.now();
-    render();
+    // the configuration screen does not use live data; rebuilding it every
+    // snapshot would wipe wizard input
+    if (S.screen === "configuration") renderHeader(); else render();
   });
   es.addEventListener("collect_error", (e) => {
     const ev = JSON.parse(e.data);
@@ -149,6 +151,7 @@ document.querySelectorAll(".nav-item").forEach(a => {
 
 /* ---------- render root ---------- */
 function render() {
+  S.renderSeq = (S.renderSeq || 0) + 1;
   renderHeader();
   const fn = {
     overview: renderOverview, topology: renderTopology, patroni: renderPatroni,
@@ -203,6 +206,7 @@ function renderOverview(m) {
   grid.append(card("etcd coordination", "c6", etcdTable(s)));
   grid.append(card("findings", "c6", findingsList(s, 6)));
   grid.append(card("virtual addresses", "c6", vipTable(s)));
+  if (s.proxy) grid.append(card("haproxy routing", "c12", proxyTable(s)));
   grid.append(card("source coverage", "c12", sourceTable(s)));
   m.append(grid);
 }
@@ -227,9 +231,9 @@ function etcdTable(s) {
   const q = s.etcd.quorum_known ? (s.etcd.quorum_lost ? chip("quorum lost", "crit") : chip("quorum ok", "ok")) : chip("quorum unknown", "warn");
   const div = el("div");
   div.innerHTML = `<p>version ${esc(s.etcd.version || "?")} · leader ${esc(s.etcd.leader_endpoint || "?")} · ${q}</p>`;
-  div.append(tbl(["endpoint","healthy","role","db size","leader changes"],
+  div.append(tbl(["name","endpoint","healthy","role","db size","leader changes"],
     s.etcd.members.map(x => [
-      esc(x.endpoint), okChip(x.reachable && x.healthy),
+      esc(x.name || "—"), esc(x.endpoint), okChip(x.reachable && x.healthy),
       x.is_leader ? chip("leader","ok") : (x.has_leader ? "follower" : "—"),
       bytes(x.db_size_bytes), dash(x.leader_changes),
     ])));
@@ -239,17 +243,30 @@ function etcdTable(s) {
 function vipTable(s) {
   const rows = [];
   (s.keepalived || []).forEach(n => rows.push([
-    esc(n.host), okChip(n.reachable), okChip(n.process_up),
+    esc(n.host), n.reachable ? okChip(true) : chip("no ssh", ""), n.reachable ? okChip(n.process_up) : "—",
     chip(n.vrrp_state || "unknown", n.vrrp_state === "MASTER" ? "ok" : n.vrrp_state === "BACKUP" ? "info" : "warn"),
-    n.vip_present ? chip("holds VIP","ok") : "—", esc(n.vip_interface || "—"),
+    n.vip_present || (s.vip || []).some(v => (v.holders || []).includes(n.host)) ? chip("holds VIP","ok") : "—", esc(n.vip_interface || "—"),
   ]));
   (s.vip || []).forEach(v => rows.push([
     "VIP " + esc(v.address) + " (" + esc(v.policy || "?") + ")", "", "", "",
     v.observed ? chip("held: " + v.holders.join(","), "ok") :
-      v.absent ? chip("ABSENT", "crit") : chip("unknown", "warn"), "",
+      v.absent ? chip("ABSENT", "crit") : chip("unknown", "warn"), esc(v.evidence || ""),
   ]));
   if (!rows.length) return "<p class='muted'>no keepalived hosts or VIPs configured</p>";
-  return tbl(["host","reachable","process","vrrp","vip","iface"], rows);
+  return tbl(["host","reachable","process","vrrp","vip","iface / evidence"], rows);
+}
+
+function proxyTable(s) {
+  const nodes = s.proxy.nodes || [];
+  return tbl(["listener", "port", "patroni check", "routes to", "VIP"].concat(nodes.map(n => n.host)),
+    (s.proxy.listeners || []).map(l => {
+      const vo = Object.values(l.vip_open || {});
+      return [
+        esc(l.name) + " " + chip(l.write ? "write" : "read", l.write ? "ok" : "info"), l.port, `<code>GET ${esc(l.check)}</code>`,
+        (l.eligible || []).length ? l.eligible.map(m => chip(m, "ok")).join(" ") : chip("none", l.write ? "crit" : "warn"),
+        vo.length ? okChip(vo.every(Boolean)) : "—",
+      ].concat(nodes.map(n => n.open[l.name] ? chip("open", "ok") : chip("closed", "crit")));
+    }));
 }
 
 function findingsList(s, limit) {
@@ -269,7 +286,7 @@ function findingsList(s, limit) {
 function sourceTable(s) {
   return tbl(["source","target","ok","ms","last ok","error"],
     (s.sources || []).map(x => [
-      esc(x.source), esc(x.target), okChip(x.ok), x.duration_ms,
+      esc(x.source), esc(x.target), x.skipped ? chip("skipped", "") : okChip(x.ok), x.duration_ms,
       x.last_ok ? ago(x.last_ok) : "—", esc(x.err || "—"),
     ]));
 }
@@ -284,8 +301,8 @@ function sourceTable(s) {
 const topoState = { tx: 0, ty: 0, k: 1, sel: null, drag: null };
 
 const EDGE_C = {
-  client: "#58a6ff", wal: "#3fb950", walWarn: "#d29922", walCrit: "#f85149",
-  vrrp: "#d29922", dcs: "#8b98a9", raft: "#8b98a9", super: "#8b98a9",
+  client: "#58a6ff", read: "#39c5cf", wal: "#3fb950", walWarn: "#d29922", walCrit: "#f85149",
+  vrrp: "#d29922", dcs: "#8b98a9", raft: "#a371f7", super: "#8b98a9",
 };
 
 function buildTopoGraph(s) {
@@ -298,20 +315,34 @@ function buildTopoGraph(s) {
   const etcM = (s.etcd && s.etcd.members) || [];
   const leader = (s.patroni && s.patroni.leader) || "";
 
-  // keepalived row — one node per observed keepalived host
-  const kx = new Map(kalive.map((n, i) => [n.host, X0 + i * COL]));
-  kalive.forEach(n => {
+  // edge tier row — keepalived hosts ∪ haproxy nodes, merged per host
+  const proxy = s.proxy || null;
+  const pNodes = (proxy && proxy.nodes) || [];
+  const listeners = (proxy && proxy.listeners) || [];
+  const tierHosts = [...new Set([...kalive.map(n => n.host), ...pNodes.map(n => n.host)])].sort();
+  const holders = new Set(vips.flatMap(v => v.holders || []));
+  const kx = new Map(tierHosts.map((h, i) => [h, X0 + i * COL]));
+  tierHosts.forEach(h => {
+    const n = kalive.find(k => k.host === h);
+    const pn = pNodes.find(p => p.host === h);
+    const isHolder = holders.has(h);
+    const anyOpen = pn && listeners.some(l => pn.open[l.name]);
+    const rows = [];
+    if (n) {
+      rows.push(["VRRP", n.reachable
+        ? chip(n.vrrp_state, n.vrrp_state === "MASTER" ? "ok" : n.vrrp_state === "BACKUP" ? "info" : "warn")
+        : isHolder ? chip("MASTER (inferred)", "ok") : chip("n/a · no ssh", "")]);
+      if (n.reachable) rows.push(["PROC", chip(n.process_up ? "up" : "down", n.process_up ? "ok" : "crit")]);
+    }
+    rows.push(["VIP", isHolder ? chip("holds VIP", "ok") : n && n.reachable ? "<span class='muted'>—</span>" : "<span class='muted'>not holder</span>"]);
+    if (pn) rows.push(["LISTEN", listeners.map(l => chip(":" + l.port + (pn.open[l.name] ? "" : " closed"), pn.open[l.name] ? "ok" : "crit")).join(" ")]);
     nodes.push({
-      id: "ka-" + n.host, x: kx.get(n.host), y: KROW_Y, w: NW, h: 104,
-      cls: !n.reachable ? "down" : n.vrrp_state === "MASTER" ? "primary" : "unknown",
-      name: n.host + " · keepalived",
-      rows: [
-        ["VRRP", chip(n.vrrp_state, n.vrrp_state === "MASTER" ? "ok" : n.vrrp_state === "BACKUP" ? "info" : "warn")],
-        ["PROC", chip(n.process_up ? "up" : "down", n.process_up ? "ok" : "crit")],
-        ["VIP", n.vip_present ? chip("holds " + (n.vip_interface || ""), "ok") : "<span class='muted'>—</span>"],
-      ],
-      detail: n.transition_evidence || n.err || "",
-      data: { kind: "keepalived", ref: n },
+      id: "ka-" + h, x: kx.get(h), y: KROW_Y, w: NW, h: 104,
+      cls: isHolder ? "primary" : (n && n.reachable) || anyOpen ? "standby" : pn && !anyOpen ? "down" : "unknown",
+      name: h + " · " + [pn ? "haproxy" : "", n ? "keepalived" : ""].filter(Boolean).join(" + "),
+      rows,
+      detail: n && n.reachable ? (n.transition_evidence || "") : pn ? "routing via Patroni health checks" : (n && n.err) || "",
+      data: { kind: "keepalived", ref: n || { host: h }, proxy: pn },
     });
   });
 
@@ -327,26 +358,40 @@ function buildTopoGraph(s) {
   nodes.push({ id: "clients", x: 30, y: KROW_Y - 40, w: 160, h: 62, cls: "unknown", name: "clients", rows: [], detail: "application connections", data: { kind: "clients" } });
   vips.forEach((v, i) => {
     const vid = "vip-" + i;
+    const ports = listeners.map(l => {
+      const open = l.vip_open && l.vip_open[v.address];
+      return open === undefined ? "" : chip(":" + l.port + (open ? "" : " closed"), open ? "ok" : "crit");
+    }).join(" ");
+    const rows = [["policy", `<span>${esc(v.policy || "leader_only")}</span>`]];
+    if (ports) rows.push(["PORTS", ports]);
     nodes.push({
-      id: vid, x: 30, y: KROW_Y + 150 + i * 110, w: 160, h: 62, cls: v.observed ? "vip" : "down",
-      name: "VIP " + v.address, rows: [["policy", `<span>${esc(v.policy || "leader_only")}</span>`]],
-      detail: v.observed ? "held by " + v.holders.join(",") : v.absent ? "ABSENT" : "unverified",
+      id: vid, x: 30, y: KROW_Y + 150 + i * 130, w: 160, h: 80, cls: v.observed ? "vip" : "down",
+      name: "VIP " + v.address, rows,
+      detail: v.observed ? "held by " + v.holders.join(",") + (v.evidence ? " · " + v.evidence.split(":")[0] : "") : v.absent ? "ABSENT" : "holder unverified",
       data: { kind: "vip", ref: v },
     });
-    edges.push({ id: "e-cli-" + i, from: ["clients", "b", i], to: [vid, "t", i], color: EDGE_C.client, width: 2 });
-    // VIP → owning keepalived host (observed client-traffic entry point)
-    (v.holders || []).forEach(hn => edges.push({
-      id: `e-vip-${i}-${hn}`, from: [vid, "r", 0], to: ["ka-" + hn, "l", 0],
-      color: EDGE_C.client, width: 2.4, label: "client traffic",
-    }));
+    edges.push({ id: "e-cli-" + i, from: ["clients", "b", i], to: [vid, "t", i], color: EDGE_C.client, width: 2, label: "app connects to VIP" });
+    // VIP → edge tier: solid to the observed holder, dashed failover path to the rest
+    const tierKa = tierHosts;
+    tierKa.forEach((h, j) => {
+      const held = (v.holders || []).includes(h);
+      // first column: enter from the left; further columns: enter from below so
+      // the curve runs in the gap between rows instead of behind other nodes
+      const into = j === 0 ? ["ka-" + h, "l", 0] : ["ka-" + h, "b", 6];
+      edges.push(held
+        ? { id: `e-vip-${i}-${h}`, from: [vid, "r", 0], to: into, color: EDGE_C.client, width: 2.6, anim: true,
+            label: "active" + (v.evidence ? " (" + v.evidence.split(":")[0] + ")" : "") }
+        : { id: `e-vip-${i}-${h}`, from: [vid, "r", j + 1], to: ["ka-" + h, "b", 8], color: EDGE_C.super, width: 1.2, dash: "4 6",
+            labelT: 0.8, label: v.observed ? "failover (VRRP backup)" : "holder unverified" });
+    });
   });
-  if (!vips.length) edges.push({ id: "e-cli-0", from: ["clients", "r", 0], to: ["ka-" + (kalive[0] ? kalive[0].host : "none"), "l", 0], color: EDGE_C.client, dash: "5 5" });
+  if (!vips.length && tierHosts.length) edges.push({ id: "e-cli-0", from: ["clients", "r", 0], to: ["ka-" + tierHosts[0], "l", 0], color: EDGE_C.client, dash: "5 5" });
 
   // pg row — order under same-named keepalived host first
   const names = members.map(x => x.name);
   const order = [
-    ...kalive.map(k => k.host).filter(h => names.includes(h)),
-    ...names.filter(n => !kalive.some(k => k.host === n)),
+    ...tierHosts.filter(h => names.includes(h)),
+    ...names.filter(n => !tierHosts.includes(n)),
   ];
   const pgX = new Map(order.map((n, i) => [n, X0 + i * COL]));
   members.forEach(x => {
@@ -356,6 +401,8 @@ function buildTopoGraph(s) {
       ["API", okChip(x.api_reachable)],
       ["TL/LAG", `<span class="muted">tl ${dash(x.timeline)} · ${x.lag_bytes < 0 ? "lag —" : "lag " + bytes(x.lag_bytes)}</span>`],
     ];
+    if (listeners.length) rows.push(["ROUTES", listeners.filter(l => (l.eligible || []).includes(x.name))
+      .map(l => chip((l.write ? "W" : "R") + " :" + l.port, l.write ? "ok" : "info")).join(" ") || "<span class='muted'>none</span>"]);
     if (be) rows.push(["PG",
       chip(be.in_recovery ? "replica" : "primary", be.in_recovery ? "info" : "ok") +
       (be.replay_lsn >= 0 ? ` <span class="muted">lsn ${be.replay_lsn.toString(16).toUpperCase()}</span>` : "")]);
@@ -368,18 +415,34 @@ function buildTopoGraph(s) {
     });
   });
 
-  // keepalived holder → pg leader: the client-traffic landing point
-  vips.forEach((v, i) => {
-    (v.holders || []).forEach(hn => {
-      if (leader && names.includes(leader))
-        edges.push({
-          id: `e-path-${i}`, from: ["ka-" + hn, "b", 0], to: ["pg-" + leader, "t", 0],
-          color: hn === leader ? EDGE_C.client : EDGE_C.walCrit,
-          width: 2, dash: hn === leader ? undefined : "6 4",
-          label: hn === leader ? "VIP→leader" : "VIP→standby (policy violation)",
-        });
+  if (listeners.length) {
+    // haproxy → pg: each listener routes to the members its Patroni check admits.
+    // Drawn from the VIP holder (the live path); from every proxy if unverified.
+    const src = pNodes.map(p => p.host).filter(h => holders.has(h));
+    const from = src.length ? src : pNodes.map(p => p.host);
+    from.forEach((h, hi) => listeners.forEach((l, li) => (l.eligible || []).forEach(m => {
+      if (!names.includes(m)) return;
+      edges.push({
+        id: `e-route-${h}-${l.name}-${m}`, from: ["ka-" + h, "b", li * 2 + 1], to: ["pg-" + m, "t", li * 2 + 1],
+        color: l.write ? EDGE_C.client : EDGE_C.read, width: src.length ? 2.4 : 1.4, anim: !!src.length,
+        dash: src.length ? undefined : "5 5", labelT: 0.75,
+        label: hi === 0 ? `:${l.port} ${l.write ? "write" : "read"} · ${l.check}=200` : "",
+      });
+    })));
+  } else {
+    // keepalived on the PG hosts: holder → pg leader is the client landing point
+    vips.forEach((v, i) => {
+      (v.holders || []).forEach(hn => {
+        if (leader && names.includes(leader))
+          edges.push({
+            id: `e-path-${i}`, from: ["ka-" + hn, "b", 0], to: ["pg-" + leader, "t", 0],
+            color: hn === leader ? EDGE_C.client : EDGE_C.walCrit,
+            width: 2, dash: hn === leader ? undefined : "6 4",
+            label: hn === leader ? "VIP→leader" : "VIP→standby (policy violation)",
+          });
+      });
     });
-  });
+  }
 
   // WAL arcs beneath the pg row: leader → replicas (animated when streaming)
   const leadNode = members.find(x => x.role === "leader");
@@ -395,35 +458,89 @@ function buildTopoGraph(s) {
     });
   });
 
-  // supervision: patroni member manages its own pg (drawn inside the node);
-  // DCS watch edges: each member → etcd group (dotted)
-  // etcd coordination group
-  if (etcM.length) {
-    const gx = X0 - 30, gw = Math.max(etcM.length * 240, 300), gy = 690;
-    groups.push({ x: gx - 10, y: gy - 34, w: gw + 20, h: 118, label: `etcd coordination · quorum ${s.etcd.quorum_known ? (s.etcd.quorum_lost ? "LOST" : "ok") : "?"}` });
-    etcM.forEach((e2, i) => {
+  // etcd ensemble. Members come from the cluster's own roster (MemberList),
+  // so a member added to etcd appears here without any config change;
+  // probed endpoints are matched to roster entries by member ID.
+  const roster = (s.etcd && s.etcd.roster) || [];
+  const links = (s.etcd && s.etcd.links) || [];
+  const leaderId = (s.etcd && s.etcd.leader_id) || "";
+  const ens = roster.map(r => ({ key: r.id, id: r.id, name: r.name, r, m: etcM.find(e => e.id === r.id) || null }));
+  etcM.filter(e => !e.id || !roster.some(r => r.id === e.id))
+    .forEach(e => ens.push({ key: e.id || e.endpoint, id: e.id || "", name: e.name || e.endpoint, r: null, m: e }));
+  ens.sort((a, b) => a.name.localeCompare(b.name));
+  const eName = (id) => (ens.find(x => x.id === id) || {}).name || id;
+  if (ens.length) {
+    const SP = 250, EW = 220, EH = 96;
+    const gx = X0 - 30, gw = Math.max(ens.length * SP - (SP - EW), 300), gy = 720;
+    const depth = 60 + (ens.length - 1) * SP * 0.15;
+    const q = s.etcd.quorum_known ? (s.etcd.quorum_lost ? "LOST" : "ok") : "?";
+    groups.push({ x: gx - 10, y: gy - 34, w: gw + 20, h: 34 + EH + depth * 0.75 + 40,
+      label: `etcd raft ensemble · ${ens.length} members (from member list) · quorum ${q}` });
+    ens.forEach((x, i) => {
+      const m = x.m, isLeader = (leaderId && x.id === leaderId) || (m && m.is_leader);
+      const rows = [];
+      if (m && m.reachable) {
+        rows.push(["RAFT", isLeader ? chip("leader", "ok") : chip(m.has_leader ? "follower" : "no leader", m.has_leader ? "info" : "warn")]);
+        rows.push(["DB", `<span class="muted">${bytes(m.db_size_bytes)} · term ${dash(m.raft_term)} · idx ${dash(m.raft_index)}</span>`]);
+      } else if (m) {
+        rows.push(["RAFT", chip("unreachable", "crit")]);
+      } else {
+        rows.push(["RAFT", isLeader ? chip("leader", "ok") : chip("member", "info")]);
+        rows.push(["SRC", chip("discovered · not in config", "warn")]);
+      }
+      rows.push(["ID", `<span class="muted">${esc(x.id || "?")}</span>`]);
       nodes.push({
-        id: "etcd-" + i, x: gx + i * 240, y: gy, w: 210, h: 66,
-        cls: !e2.reachable ? "down" : e2.is_leader ? "primary" : "unknown",
-        name: e2.endpoint, rows: [
-          ["RAFT", e2.is_leader ? chip("leader", "ok") : chip(e2.has_leader ? "follower" : "no leader", e2.has_leader ? "info" : "warn")],
-          ["DB", `<span class="muted">${bytes(e2.db_size_bytes)} · ${dash(e2.leader_changes)} leader chg</span>`],
-        ],
-        detail: e2.err || "", data: { kind: "etcd", ref: e2 },
-      });
-      if (i > 0) edges.push({
-        id: `e-raft-${i}`, from: ["etcd-" + (i - 1), "r", 0], to: ["etcd-" + i, "l", 0],
-        color: EDGE_C.raft, dash: "3 4", label: i === 1 ? "raft" : "",
+        id: "etcd-" + x.key, x: gx + i * SP, y: gy, w: EW, h: EH,
+        cls: m && !m.reachable ? "down" : isLeader ? "primary" : m ? "unknown" : "standby",
+        name: x.name + (m ? " · " + m.endpoint : ""), rows,
+        detail: (m && m.err) || (x.r ? "peer " + (x.r.peer_urls || []).join(",") : ""),
+        data: { kind: "etcd", ref: m || { endpoint: (x.r.client_urls || []).join(",") }, roster: x.r, id: x.id },
       });
     });
-    // DCS watch: patroni member bottom → etcd group top (single converging dotted)
-    order.forEach(n => {
+    // raft streams: every member keeps a peer stream (:2380) to every other;
+    // log replication flows leader → followers. Evidence is each sender's
+    // etcd_network_active_peers / peer_sent_bytes_total.
+    const link = (a, b) => links.find(l => l.from === a && l.to === b);
+    const rate = (l) => l && l.bps >= 0 ? (l.bps >= 1024 ? (l.bps / 1024).toFixed(1) + " KiB/s" : l.bps.toFixed(0) + " B/s") : "";
+    let k = 0;
+    for (let i = 0; i < ens.length; i++)
+      for (let j = i + 1; j < ens.length; j++) {
+        const A = ens[i], B = ens[j];
+        const lead = leaderId && (A.id === leaderId || B.id === leaderId);
+        const [src, dst] = lead && B.id === leaderId ? [B, A] : [A, B];
+        const fwd = link(src.id, dst.id), rev = link(dst.id, src.id);
+        const seen = [fwd, rev].filter(Boolean);
+        const down = seen.some(l => !l.active);
+        const up = seen.length && !down;
+        k++;
+        if (lead) {
+          edges.push({
+            id: `e-raft-${src.key}-${dst.key}`, from: ["etcd-" + src.key, "b", k % 3 + 2], to: ["etcd-" + dst.key, "b", k % 3 + 2],
+            color: down ? EDGE_C.walCrit : up ? EDGE_C.raft : EDGE_C.super, width: up ? 2.2 : 1.4,
+            anim: !!up, dash: up ? undefined : "5 5",
+            label: down ? "raft stream DOWN" : up ? `raft append${rate(fwd) ? " · " + rate(fwd) : ""}` : "raft (unverified)",
+          });
+        } else {
+          edges.push({
+            id: `e-peer-${A.key}-${B.key}`, from: ["etcd-" + A.key, "b", k % 3 + 2], to: ["etcd-" + B.key, "b", k % 3 + 2],
+            color: down ? EDGE_C.walCrit : EDGE_C.super, width: 1, dash: "2 4",
+            label: down ? "peer stream DOWN" : !leaderId ? "peer (no raft leader)" : up ? "peer stream" : "",
+          });
+        }
+      }
+    // Patroni → etcd: every member keeps its member key and watches the
+    // leader key; the leader also renews the leader key + lease every
+    // loop_wait. Patroni's client picks one endpoint, so the edge targets
+    // the ensemble rather than a guessed member.
+    order.forEach((n, oi) => {
       const node = "pg-" + n;
-      if (nodes.some(nd => nd.id === node))
-        edges.push({
-          id: "e-dcs-" + n, from: [node, "b", 5], to: [{ x: gx + gw / 2, y: gy - 34 }, "t", 0],
-          color: EDGE_C.dcs, dash: "2 5", width: 1, label: n === order[0] ? "DCS watch/lease" : "",
-        });
+      if (!nodes.some(nd => nd.id === node)) return;
+      const isL = n === leader;
+      edges.push({
+        id: "e-dcs-" + n, from: [node, "b", 5], to: [{ x: gx + gw * (oi + 1) / (order.length + 1), y: gy - 34 }, "t", 0],
+        color: isL ? EDGE_C.client : EDGE_C.dcs, dash: "2 5", width: isL ? 1.6 : 1, labelT: 0.22,
+        label: isL ? "leader key + lease renew" : "member key + watch",
+      });
     });
   }
 
@@ -445,11 +562,24 @@ function anchor(g, ref) {
   }
 }
 
-function edgePath(a, b, side) {
-  const d = 60;
-  if (side === "b") return `M${a.x} ${a.y} C${a.x} ${a.y + d},${b.x} ${b.y + d},${b.x} ${b.y}`;
-  if (side === "t") return `M${a.x} ${a.y} C${a.x} ${a.y - d},${b.x} ${b.y - d},${b.x} ${b.y}`;
-  return `M${a.x} ${a.y} C${a.x + d} ${a.y},${b.x - d} ${b.y},${b.x} ${b.y}`;
+function edgeCtrl(a, b, fs, ts) {
+  // each control point leaves/enters along its own anchor side; same-side
+  // arcs (b→b, t→t) deepen with span so parallel arcs nest instead of overlap
+  const d = fs === ts && (fs === "b" || fs === "t") ? 60 + Math.abs(b.x - a.x) * 0.15 : 60;
+  const off = (p, s) => s === "b" ? [p.x, p.y + d] : s === "t" ? [p.x, p.y - d] : s === "l" ? [p.x - d, p.y] : [p.x + d, p.y];
+  return [off(a, fs), off(b, ts)];
+}
+
+function edgePath(a, b, fs, ts) {
+  const [c1, c2] = edgeCtrl(a, b, fs, ts);
+  return `M${a.x} ${a.y} C${c1[0]} ${c1[1]},${c2[0]} ${c2[1]},${b.x} ${b.y}`;
+}
+
+// point on the drawn cubic at parameter t (labels sit on the curve itself)
+function edgePoint(a, b, fs, ts, t) {
+  const [c1, c2] = edgeCtrl(a, b, fs, ts);
+  const u = 1 - t, w0 = u * u * u, w1 = 3 * u * u * t, w2 = 3 * u * t * t, w3 = t * t * t;
+  return { x: w0 * a.x + w1 * c1[0] + w2 * c2[0] + w3 * b.x, y: w0 * a.y + w1 * c1[1] + w2 * c2[1] + w3 * b.y };
 }
 
 function renderTopoEdges(g, svgNS) {
@@ -457,11 +587,12 @@ function renderTopoEdges(g, svgNS) {
   parts.push(`<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="context-stroke"/></marker></defs>`);
   g.edges.forEach(e => {
     const a = anchor(g, e.from), b = anchor(g, e.to);
-    const d = edgePath(a, b, e.from[1]);
+    const d = edgePath(a, b, e.from[1], e.to[1]);
     const w = e.width || 1.4;
     parts.push(`<path d="${d}" fill="none" stroke="${e.color}" stroke-width="${w}"${e.dash ? ` stroke-dasharray="${e.dash}"` : ""}${e.anim ? ' class="edge-anim" stroke-dasharray="10 8"' : ""} marker-end="url(#arr)" pointer-events="stroke" style="pointer-events:visibleStroke"/>`);
     if (e.label) {
-      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2 - 8;
+      const p = edgePoint(a, b, e.from[1], e.to[1], e.labelT || 0.5);
+      const mx = p.x, my = p.y - 6;
       parts.push(`<text x="${mx}" y="${my}" text-anchor="middle" fill="${e.color}" font-size="10" font-family="ui-monospace,monospace" style="paint-order:stroke;stroke:var(--bg);stroke-width:4">${esc(e.label)}</text>`);
     }
   });
@@ -485,8 +616,12 @@ function renderTopology(m) {
     <button data-z="fit" title="fit">⤢</button></div>
     <div class="topo-view"><svg class="topo-edges" width="4000" height="1600"></svg><div class="topo-nodes"></div></div>`;
   const legend = el("div", "topo-legend");
-  legend.innerHTML = `<span><b style="color:${EDGE_C.client}">━▶</b> client traffic (VIP → keepalived MASTER → leader)</span>
+  legend.innerHTML = `<span><b style="color:${EDGE_C.client}">━▶</b> client / write path (clients → VIP → holder → primary)</span>
+    <span><b style="color:${EDGE_C.read}">━▶</b> read path (Patroni /replica check)</span>
+    <span><b style="color:${EDGE_C.super}">┄▶</b> VIP failover target / unverified</span>
     <span><b style="color:${EDGE_C.wal}">━▶</b> WAL replication (animated = streaming)</span>
+    <span><b style="color:${EDGE_C.raft}">━▶</b> etcd raft append leader → follower (:2380)</span>
+    <span><b style="color:${EDGE_C.super}">┄┄</b> etcd follower peer stream</span>
     <span><b style="color:${EDGE_C.vrrp}">┄┄</b> VRRP adverts</span>
     <span><b style="color:${EDGE_C.dcs}">┄┄</b> DCS watch/lease</span>
     <span>click a node for evidence · drag to pan · wheel to zoom</span>`;
@@ -499,7 +634,6 @@ function renderTopology(m) {
   const view = wrap.querySelector(".topo-view");
   const nodesDiv = wrap.querySelector(".topo-nodes");
   const svg = wrap.querySelector("svg");
-  svg.innerHTML = renderTopoEdges(g, "http://www.w3.org/2000/svg");
   nodesDiv.innerHTML = "";
   g.groups.forEach(gr => {
     const d = el("div", "topo-group", gr.label);
@@ -513,7 +647,11 @@ function renderTopology(m) {
     d.innerHTML = topoNodeHTML(n);
     d.addEventListener("click", (ev) => { ev.stopPropagation(); topoState.sel = n.id; renderTopoDrawer(wrap, n); });
     nodesDiv.append(d);
+    n.el = d;
   });
+  // anchor edges on rendered node boxes (content height varies with rows)
+  g.nodes.forEach(n => { if (n.el.offsetHeight) n.h = n.el.offsetHeight; });
+  svg.innerHTML = renderTopoEdges(g, "http://www.w3.org/2000/svg");
   // keep an open drawer in sync with the refreshed graph
   if (topoState.sel) {
     const sn = nodeById(g, topoState.sel);
@@ -597,18 +735,40 @@ function renderTopoDrawer(wrap, n) {
         ["replay lsn", dash(b.replay_lsn)], ["wal dir", bytes(b.wal_dir_bytes)]);
     }
   } else if (n.data.kind === "keepalived") {
-    kv.push(["reachable", String(r.reachable)], ["process", r.process_up ? "up" : "down"],
-      ["vrrp state", r.vrrp_state], ["vip present", String(!!r.vip_present)],
-      ["iface", r.vip_interface || "—"], ["last transition", r.last_transition || "—"],
-      ["evidence", r.transition_evidence || "—"]);
+    if (r.vrrp_state !== undefined)
+      kv.push(["reachable", String(r.reachable)], ["process", r.reachable ? (r.process_up ? "up" : "down") : "unknown (no ssh)"],
+        ["vrrp state", r.vrrp_state], ["vip present", String(!!r.vip_present)],
+        ["iface", r.vip_interface || "—"], ["last transition", r.last_transition || "—"],
+        ["evidence", r.transition_evidence || "—"]);
+    (s.vip || []).forEach(v => kv.push(["VIP " + v.address,
+      (v.holders || []).includes(r.host) ? "held here · " + (v.evidence || "") : v.observed ? "held by " + v.holders.join(",") : "unverified"]));
+    if (n.data.proxy) ((s.proxy && s.proxy.listeners) || []).forEach(l => kv.push([
+      `listen ${l.name} :${l.port}`,
+      `${n.data.proxy.open[l.name] ? "open" : "CLOSED"} · GET ${l.check} → [${(l.eligible || []).join(",") || "none"}]`]));
   } else if (n.data.kind === "etcd") {
-    kv.push(["endpoint", r.endpoint], ["reachable", String(r.reachable)], ["healthy", String(r.healthy)],
-      ["raft role", r.is_leader ? "leader" : r.has_leader ? "follower" : "no leader"],
-      ["db size", bytes(r.db_size_bytes)], ["leader changes", dash(r.leader_changes)], ["err", r.err || "—"]);
+    const e = s.etcd || {};
+    const nm = (id) => ((e.roster || []).find(x => x.id === id) || {}).name || id;
+    kv.push(["member id", n.data.id || "?"], ["endpoint", r.endpoint || "—"],
+      ["configured", r.reachable === undefined ? "no — discovered from member list" : "yes"]);
+    if (n.data.roster) kv.push(["peer urls", (n.data.roster.peer_urls || []).join(", ")],
+      ["client urls", (n.data.roster.client_urls || []).join(", ")]);
+    if (r.reachable !== undefined)
+      kv.push(["reachable", String(r.reachable)], ["healthy", String(r.healthy)],
+        ["raft role", r.is_leader ? "leader" : r.has_leader ? "follower" : "no leader"],
+        ["raft term / index", `${dash(r.raft_term)} / ${dash(r.raft_index)}`],
+        ["db size", bytes(r.db_size_bytes)], ["leader changes", dash(r.leader_changes)], ["err", r.err || "—"]);
+    (e.links || []).filter(l => l.from === n.data.id || l.to === n.data.id).forEach(l => kv.push([
+      `stream ${nm(l.from)} → ${nm(l.to)}`,
+      (l.active ? "active" : "DOWN") + (l.bps >= 0 ? ` · ${l.bps.toFixed(0)} B/s` : "") + (l.from === e.leader_id ? " · leader append" : "")]));
   } else if (n.data.kind === "vip") {
     kv.push(["address", r.address], ["policy", r.policy || "?"], ["iface", r.interface || "any"],
       ["holders", (r.holders || []).join(", ") || "none"],
-      ["state", r.observed ? "observed" : r.absent ? "absent" : "unverified"]);
+      ["state", r.observed ? "observed" : r.absent ? "absent" : "unverified"],
+      ["evidence", r.evidence || "—"]);
+    ((s.proxy && s.proxy.listeners) || []).forEach(l => {
+      const o = l.vip_open && l.vip_open[r.address];
+      if (o !== undefined) kv.push([`${r.address}:${l.port}`, (o ? "accepting" : "CLOSED") + " · " + l.name]);
+    });
   }
   // matching source-health rows are the freshness evidence
   (s.sources || []).filter(x => n.name.startsWith(x.target) || (r.endpoint && x.target === r.endpoint))
@@ -663,7 +823,9 @@ function renderEvents(m) {
 
 /* ---------- operations console ---------- */
 async function renderOperations(m) {
-  m.innerHTML = "";
+  // build off-DOM and swap once all fetches finish: clearing first left the
+  // page blank during the awaits (visible flicker on every snapshot)
+  const seq = S.renderSeq;
   const grid = el("div", "grid");
 
   let mon = { running: false, seq: 0 };
@@ -702,7 +864,9 @@ async function renderOperations(m) {
   grid.append(card("operations journal", "c12",
     rows.length ? tbl(["time","operator","action","target","result","detail"], rows)
                 : "<p class='muted'>no operations recorded</p>"));
-  m.append(grid);
+  if (seq !== S.renderSeq) return; // a newer render superseded this one
+  m.replaceChildren(grid);
+  log.scrollTop = log.scrollHeight;
 }
 
 // unit → role + observed state from the live snapshot
@@ -726,6 +890,11 @@ function svcState(host, unit, s) {
       return [b.in_recovery ? "replica" : "primary", "ok"];
     }
     case "keepalived": {
+      if (host.ssh_disabled) {
+        // No SSH by config: VRRP state is unobservable; only ARP holder evidence exists.
+        const holds = (s.vip || []).some(v => (v.holders || []).includes(host.name));
+        return holds ? ["VIP holder (arp)", "ok"] : ["not observed · no ssh", "mut"];
+      }
       const k = byName(s.keepalived, x => x.host === host.name || x.host === host.address);
       if (!k) return ["n/a", "mut"];
       if (!k.reachable) return ["unreachable", "crit"];
@@ -733,7 +902,10 @@ function svcState(host, unit, s) {
       return [k.vrrp_state || "?", k.vrrp_state === "MASTER" || k.vrrp_state === "BACKUP" ? "ok" : "warn"];
     }
     case "etcd": {
-      const e = byName(s.etcd && s.etcd.members, x => (x.endpoint || "").split(":")[0] === host.name);
+      const e = byName(s.etcd && s.etcd.members, x => {
+        const h = (x.endpoint || "").split(":")[0];
+        return h === host.name || h === host.address || (x.name && x.name === host.name);
+      });
       if (!e) return ["n/a", "mut"];
       if (!e.reachable) return ["down", "crit"];
       return [e.healthy ? (e.is_leader ? "healthy·leader" : "healthy") : "unhealthy", e.healthy ? "ok" : "warn"];
@@ -750,7 +922,8 @@ function svcMatrix(cfg) {
     const cells = SVC_UNITS.map(u => {
       if (!(h.roles || []).includes(unitRole[u])) return `<td class="muted">—</td>`;
       const [st, sev] = svcState(h, u, s);
-      const dis = h.ssh_disabled ? "disabled" : "";
+      const dis = h.ssh_disabled
+        ? `disabled title="service control runs over SSH; ${esc(h.name)} has ssh_disabled: true"` : "";
       return `<td><span class="svc-cell">${chip(st, sev)}</span>
         <span class="svc-btns">
           <button class="btn mini" data-svc="status" data-unit="${u}" data-host="${esc(h.name)}" ${dis}>st</button>
@@ -761,7 +934,12 @@ function svcMatrix(cfg) {
     }).join("");
     return `<tr><td><b class="mono">${esc(h.name)}</b><div class="muted" style="font-size:10px">${esc((h.roles || []).join(" "))}</div></td>${cells}</tr>`;
   }).join("");
-  return `<table class="tbl"><thead><tr><th>HOST</th>${SVC_UNITS.map(u => "<th>" + u.toUpperCase() + "</th>").join("")}</tr></thead><tbody>${rows}</tbody></table>
+  const noSSH = hosts.filter(h => h.ssh_disabled).map(h => h.name);
+  const sshNote = noSSH.length ? `<p class="muted" style="margin-top:.4rem">${chip("controls disabled", "warn")}
+    no SSH access configured for ${esc(noSSH.join(", "))} (ssh_disabled: true) — start/stop/restart/status
+    execute over SSH, so they are unavailable for these hosts. Enable sshd + key on the host and clear
+    ssh_disabled to turn them on.</p>` : "";
+  return `<table class="tbl"><thead><tr><th>HOST</th>${SVC_UNITS.map(u => "<th>" + u.toUpperCase() + "</th>").join("")}</tr></thead><tbody>${rows}</tbody></table>${sshNote}
     <p class="muted" style="margin-top:.4rem">state = observed from the live snapshot · ▶ start · ■ stop · ⟳ restart · st status — mutations need typed host confirmation and are journaled</p>`;
 }
 
@@ -793,7 +971,7 @@ const wizard = { step: 0, host: { name:"", address:"", ssh_user:"root", roles:[]
   patroni_port: 8008, pg_port: 5432, pg_adapter: "", probe: null, msg: "" };
 
 async function renderConfiguration(m) {
-  m.innerHTML = "";
+  const seq = S.renderSeq;
   const grid = el("div", "grid");
 
   // current config
@@ -820,7 +998,8 @@ async function renderConfiguration(m) {
 
   // wizard
   grid.append(card("add machine to monitoring", "c12", wizardView()));
-  m.append(grid);
+  if (seq !== S.renderSeq) return;
+  m.replaceChildren(grid);
 
   m.querySelectorAll("[data-delhost]").forEach(b => b.addEventListener("click", async () => {
     if (!confirm("Remove " + b.dataset.delhost + " from monitoring?")) return;

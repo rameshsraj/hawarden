@@ -132,7 +132,11 @@ func (s *Service) Probe(ctx context.Context, h config.Host) model.ProbeResult {
 	}
 	if h.Has(config.RoleEtcd) {
 		check("etcd:health", func() (string, error) {
-			cli := etcd.NewClient(net.JoinHostPort(h.Address, "2379"), s.Cfg.Etcd.DialTimeout)
+			tc, err := etcd.TLSConfig(s.Cfg.Etcd.CACertRef, s.Cfg.Etcd.CertRef, s.Cfg.Etcd.KeyRef)
+			if err != nil {
+				return "", err
+			}
+			cli := etcd.NewClient(net.JoinHostPort(h.Address, "2379"), s.Cfg.Etcd.DialTimeout, tc)
 			ok, err := cli.Health(ctx)
 			if err != nil {
 				return "", err

@@ -154,6 +154,22 @@ func (c *Client) Member(ctx context.Context) (state, role string, pendingRestart
 	return mj.State, mj.Role, mj.PendingRestart, tl, nil
 }
 
+// Check returns the HTTP status of a Patroni health endpoint (/primary,
+// /replica, ...) — the same probe HAProxy uses to choose backends.
+func (c *Client) Check(ctx context.Context, path string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.Base+path, nil)
+	if err != nil {
+		return 0, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	return resp.StatusCode, nil
+}
+
 // History fetches GET /history (failover evidence).
 func (c *Client) History(ctx context.Context) ([]model.HistoryEntry, error) {
 	body, err := c.get(ctx, "/history")

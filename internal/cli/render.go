@@ -47,6 +47,7 @@ func renderStatus(w io.Writer, s *model.Snapshot) {
 	renderCluster(w, s)
 	renderEtcd(w, s)
 	renderVIP(w, s)
+	renderProxy(w, s)
 	renderDiagnose(w, s)
 }
 
@@ -88,7 +89,7 @@ func renderEtcd(w io.Writer, s *model.Snapshot) {
 	fmt.Fprintf(w, "version: %s   leader: %s   %s\n",
 		orDash(s.Etcd.Version), orDash(s.Etcd.LeaderEndpoint), q)
 	t := tw(w)
-	fmt.Fprintln(t, "ENDPOINT\tHEALTHY\tLEADER\tDB BYTES\tLEADER CHANGES\tERR")
+	fmt.Fprintln(t, "ENDPOINT\tNAME\tID\tHEALTHY\tLEADER\tDB BYTES\tLEADER CHANGES\tERR")
 	for _, m := range s.Etcd.Members {
 		role := ""
 		if m.IsLeader {
@@ -96,11 +97,36 @@ func renderEtcd(w io.Writer, s *model.Snapshot) {
 		} else if m.HasLeader {
 			role = "follower"
 		}
-		fmt.Fprintf(t, "%s\t%v\t%s\t%s\t%s\t%s\n",
-			m.Endpoint, m.Healthy, orDash(role), int64OrDash(m.DBSizeBytes),
+		fmt.Fprintf(t, "%s\t%s\t%s\t%v\t%s\t%s\t%s\t%s\n",
+			m.Endpoint, orDash(m.Name), orDash(m.ID), m.Healthy, orDash(role), int64OrDash(m.DBSizeBytes),
 			int64OrDash(m.LeaderChanges), orDash(m.Err))
 	}
 	t.Flush()
+	name := map[string]string{}
+	for _, r := range s.Etcd.Roster {
+		name[r.ID] = r.Name
+		if r.Endpoint == "" {
+			fmt.Fprintf(w, "discovered (not configured): %s id=%s client=%s\n", r.Name, r.ID, strings.Join(r.ClientURLs, ","))
+		}
+	}
+	if len(s.Etcd.Links) > 0 {
+		fmt.Fprintln(w, "raft peer streams (sender's view):")
+		for _, l := range s.Etcd.Links {
+			st := "active"
+			if !l.Active {
+				st = "DOWN"
+			}
+			rate := "-"
+			if l.Bps >= 0 {
+				rate = fmt.Sprintf("%.0f B/s", l.Bps)
+			}
+			mark := ""
+			if l.From == s.Etcd.LeaderID {
+				mark = "  (leader append)"
+			}
+			fmt.Fprintf(w, "  %s -> %s  %s  %s%s\n", orDash(name[l.From]), orDash(name[l.To]), st, rate, mark)
+		}
+	}
 }
 
 func renderVIP(w io.Writer, s *model.Snapshot) {
@@ -119,20 +145,63 @@ func renderVIP(w io.Writer, s *model.Snapshot) {
 		} else if v.Absent {
 			st = "ABSENT"
 		}
-		fmt.Fprintf(t, "vip %s (%s)\t\t\t\t%s\t%s\t\n",
-			v.Address, orDash(v.Policy), st, orDash(v.Interface))
+		fmt.Fprintf(t, "vip %s (%s)\t\t\t\t%s\t%s\t%s\n",
+			v.Address, orDash(v.Policy), st, orDash(v.Interface), v.Evidence)
 	}
 	t.Flush()
+}
+
+func renderProxy(w io.Writer, s *model.Snapshot) {
+	if s.Proxy == nil {
+		return
+	}
+	fmt.Fprintln(w, "\n== haproxy routing ==")
+	t := tw(w)
+	fmt.Fprint(t, "LISTENER\tPORT\tCHECK\tROUTES TO\tVIP")
+	for _, n := range s.Proxy.Nodes {
+		fmt.Fprintf(t, "\t%s", n.Host)
+	}
+	fmt.Fprintln(t)
+	for _, l := range s.Proxy.Listeners {
+		vip := "-"
+		for _, v := range s.VIP {
+			if open, ok := l.VIPOpen[v.Address]; ok {
+				vip = openStr(open)
+			}
+		}
+		fmt.Fprintf(t, "%s\t%d\t%s\t%s\t%s", l.Name, l.Port, l.Check, orDash(strings.Join(l.Eligible, ",")), vip)
+		for _, n := range s.Proxy.Nodes {
+			fmt.Fprintf(t, "\t%s", openStr(n.Open[l.Name]))
+		}
+		fmt.Fprintln(t)
+	}
+	t.Flush()
+}
+
+func openStr(b bool) string {
+	if b {
+		return "open"
+	}
+	return "CLOSED"
 }
 
 func renderTopology(w io.Writer, s *model.Snapshot) {
 	fmt.Fprintln(w, "\n== topology ==")
 	for _, v := range s.VIP {
-		holders := "none"
+		holders := "unverified"
 		if len(v.Holders) > 0 {
 			holders = strings.Join(v.Holders, ",")
 		}
-		fmt.Fprintf(w, "clients -> VIP %s -> keepalived[%s]\n", v.Address, holders)
+		fmt.Fprintf(w, "clients -> VIP %s -> [%s]", v.Address, holders)
+		if v.Evidence != "" {
+			fmt.Fprintf(w, "   (%s)", v.Evidence)
+		}
+		fmt.Fprintln(w)
+		if s.Proxy != nil {
+			for _, l := range s.Proxy.Listeners {
+				fmt.Fprintf(w, "  :%d %s -> %s  (GET %s)\n", l.Port, l.Name, orDash(strings.Join(l.Eligible, ",")), l.Check)
+			}
+		}
 	}
 	for _, m := range s.Patroni.Members {
 		fmt.Fprintf(w, "  patroni[%s] role=%s state=%s -> pg[%s]\n", m.Name, m.Role, m.State, m.Host)
@@ -169,7 +238,11 @@ func renderHealth(w io.Writer, s *model.Snapshot) {
 	t := tw(w)
 	fmt.Fprintln(t, "SOURCE\tTARGET\tOK\tMS\tERR")
 	for _, h := range s.Sources {
-		fmt.Fprintf(t, "%s\t%s\t%v\t%d\t%s\n", h.Source, h.Target, h.OK, h.DurationMs, orDash(h.Err))
+		ok := fmt.Sprint(h.OK)
+		if h.Skipped {
+			ok = "skipped"
+		}
+		fmt.Fprintf(t, "%s\t%s\t%s\t%d\t%s\n", h.Source, h.Target, ok, h.DurationMs, orDash(h.Err))
 	}
 	t.Flush()
 }

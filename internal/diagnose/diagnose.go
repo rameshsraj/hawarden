@@ -5,6 +5,7 @@ package diagnose
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rameshsraj/hawarden/internal/model"
@@ -72,6 +73,26 @@ func Run(snap *model.Snapshot) []model.Finding {
 		add("ETCD_ALARM", "CRIT", "etcd alarm: "+a, []string{a},
 			[]string{"NOSPACE or CORRUPT alarm raised"},
 			[]string{"hawarden dcs"})
+	}
+	name := map[string]string{}
+	for _, r := range snap.Etcd.Roster {
+		name[r.ID] = r.Name
+		if r.Endpoint == "" {
+			add("ETCD_MEMBER_UNCONFIGURED", "INFO",
+				"etcd member "+r.Name+" is in the cluster but not monitored",
+				[]string{"member list: id " + r.ID + " client " + strings.Join(r.ClientURLs, ",")},
+				[]string{"member added after hawarden was configured"},
+				[]string{"add its client endpoint to etcd.endpoints in the hawarden config"})
+		}
+	}
+	for _, l := range snap.Etcd.Links {
+		if !l.Active {
+			add("ETCD_PEER_DOWN", "WARN",
+				fmt.Sprintf("no raft stream %s → %s", or(name[l.From], l.From), or(name[l.To], l.To)),
+				[]string{"etcd_network_active_peers on " + or(name[l.From], l.From) + " has no entry for " + l.To},
+				[]string{"peer down", "peer port 2380 blocked", "peer TLS failure"},
+				[]string{"hawarden dcs"})
+		}
 	}
 
 	// --- Patroni maintenance / restart ------------------------------------
@@ -168,5 +189,57 @@ func Run(snap *model.Snapshot) []model.Finding {
 		}
 	}
 
+	// --- HAProxy routing -----------------------------------------------------
+	if p := snap.Proxy; p != nil {
+		for _, l := range p.Listeners {
+			subj := fmt.Sprintf("%s :%d (%s)", l.Name, l.Port, l.Check)
+			ev := []string{fmt.Sprintf("GET %s → 200 on [%s]", l.Check, strings.Join(l.Eligible, ","))}
+			if len(l.Unreachable) > 0 {
+				ev = append(ev, "check unreadable on "+strings.Join(l.Unreachable, ","))
+			}
+			switch {
+			case l.Write && len(l.Eligible) == 0:
+				add("PROXY_NO_WRITE_TARGET", "CRIT", subj+" has no eligible primary — writes fail", ev,
+					[]string{"no leader", "leader Patroni API unreachable"},
+					[]string{"hawarden cluster", "hawarden topology"})
+			case l.Write && len(l.Eligible) > 1:
+				add("PROXY_MULTI_WRITE", "CRIT", subj+" admits more than one primary", ev,
+					[]string{"split brain", "stale leader still answering /primary"},
+					[]string{"hawarden cluster"})
+			case !l.Write && len(l.Eligible) == 0:
+				add("PROXY_NO_READ_TARGET", "WARN", subj+" has no eligible member — reads fail", ev,
+					[]string{"no streaming replica"},
+					[]string{"hawarden cluster", "hawarden lag"})
+			}
+			for _, v := range snap.VIP {
+				if open, ok := l.VIPOpen[v.Address]; ok && !open {
+					add("PROXY_VIP_CLOSED", "CRIT",
+						fmt.Sprintf("VIP %s:%d not accepting connections", v.Address, l.Port),
+						[]string{"TCP connect to " + v.Address + " failed"},
+						[]string{"VIP not held", "haproxy down on VIP holder"},
+						[]string{"hawarden vip", "hawarden topology"})
+				}
+			}
+		}
+		for _, n := range p.Nodes {
+			for _, l := range p.Listeners {
+				if open, ok := n.Open[l.Name]; ok && !open {
+					add("PROXY_LISTENER_DOWN", "WARN",
+						fmt.Sprintf("haproxy listener %s closed on %s", l.Name, n.Host),
+						[]string{"TCP connect to " + n.Address + " failed"},
+						[]string{"haproxy stopped", "bind failed"},
+						[]string{"hawarden topology"})
+				}
+			}
+		}
+	}
+
 	return out
+}
+
+func or(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
